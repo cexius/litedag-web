@@ -4,13 +4,13 @@ import { NETWORK_ID, LEGACY_MAINNET_NETWORK_ID, FEE_PER_BYTE_V2 } from "@litedag
 import { rpc } from "@/lib/rpc-client"
 import type { Wallet } from "@/lib/crypto"
 import type { GetAddressResponse } from "@litedag/shared/rpc-types"
+import { parseAddress, ADDRESS_SIZE } from "@/lib/address"
 
 const TX_VERSION_TRANSFER = 1
 const TX_VERSION_SET_DELEGATE = 3
 const TX_VERSION_STAKE = 4
 const TX_VERSION_UNSTAKE = 5
 
-const ADDRESS_SIZE = 22
 const SIGNATURE_SIZE = 64
 
 type Tx = {
@@ -33,43 +33,6 @@ function encodeVarint(n: bigint | number): Uint8Array {
   }
   bytes.push(Number(num & 0xffn))
   return new Uint8Array(bytes)
-}
-
-function parseAddressToBytes(addressStr: string): { address: Uint8Array; paymentId: number } {
-  const trimmed = addressStr.trim()
-  assert(trimmed.length >= 5 && trimmed.length <= 100, `Invalid address length: ${trimmed.length}`)
-  assert(trimmed.startsWith("v"), "Address must start with 'v'")
-
-  const addrStr = trimmed.slice(1)
-  assert(/^[0-9a-z]+$/.test(addrStr), "Address contains invalid characters")
-
-  let bigInt = 0n
-  for (let i = 0; i < addrStr.length; i++) {
-    const c = addrStr.charCodeAt(i)
-    const value = c >= 97 ? c - 87 : c - 48 // a=10..z=35, 0=0..9=9
-    bigInt = bigInt * 36n + BigInt(value)
-  }
-
-  const bytes: number[] = []
-  let n = bigInt
-  while (n > 0n) {
-    bytes.unshift(Number(n & 0xffn))
-    n = n >> 8n
-  }
-  while (bytes.length < 24) bytes.unshift(0)
-
-  // Extract paymentId if present (data length > 24)
-  let paymentId = 0
-  if (bytes.length > 24) {
-    const paymentIdBytes = bytes.slice(24)
-    // Convert little-endian bytes to uint64
-    for (let i = 0; i < Math.min(8, paymentIdBytes.length); i++) {
-      paymentId |= paymentIdBytes[i] << (i * 8)
-    }
-  }
-
-  // Skip first 2 bytes (checksum), return 22-byte address
-  return { address: new Uint8Array(bytes.slice(2, 24)), paymentId }
 }
 
 function assert(condition: boolean, msg: string): asserts condition {
@@ -96,9 +59,10 @@ function bytesToHex(bytes: Uint8Array): string {
 // --- Serialization ---
 
 function serializeOutput(recipient: string, paymentId: number, amount: bigint): Uint8Array {
-  const parsed = parseAddressToBytes(recipient)
-  const effectivePaymentId = paymentId !== 0 ? paymentId : parsed.paymentId
-  return concatBytes(parsed.address, encodeVarint(effectivePaymentId), encodeVarint(amount))
+  const parsed = parseAddress(recipient)
+  // Integrated address carries its own payment_id — use it unless caller overrides
+  const pid = parsed.paymentId !== 0 ? parsed.paymentId : paymentId
+  return concatBytes(new Uint8Array(parsed.addr), encodeVarint(pid), encodeVarint(amount))
 }
 
 function serializeTransferData(outputs: { recipient: string; paymentId: number; amount: bigint }[]): Uint8Array {
@@ -218,11 +182,7 @@ export async function createAndSignTransfer(
 ): Promise<{ hex: string; hash: string }> {
   const nonce = await getNonce(wallet.address)
   const data = serializeTransferData(
-    outputs.map((o) => {
-      const parsed = parseAddressToBytes(o.recipient)
-      const effectivePaymentId = o.paymentId ?? parsed.paymentId
-      return { recipient: o.recipient, paymentId: effectivePaymentId, amount: o.amount }
-    })
+    outputs.map((o) => ({ recipient: o.recipient, paymentId: o.paymentId ?? 0, amount: o.amount }))
   )
   const tx: Tx = {
     version: TX_VERSION_TRANSFER,
@@ -302,11 +262,7 @@ export async function submitTransaction(hex: string): Promise<{ result: boolean 
 
 export function estimateTransferFee(outputs: TransferOutput[]): bigint {
   const data = serializeTransferData(
-    outputs.map((o) => {
-      const parsed = parseAddressToBytes(o.recipient)
-      const effectivePaymentId = o.paymentId ?? parsed.paymentId
-      return { recipient: o.recipient, paymentId: effectivePaymentId, amount: o.amount }
-    })
+    outputs.map((o) => ({ recipient: o.recipient, paymentId: o.paymentId ?? 0, amount: o.amount }))
   )
   const tx: Tx = {
     version: TX_VERSION_TRANSFER,
